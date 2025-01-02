@@ -32,9 +32,27 @@ if not connection_string:
     sitl = dronekit_sitl.start_default()
     connection_string = sitl.connection_string()
 
-# Vehicle se connect ho rahe hain
-print(f'Connecting to vehicle on: {connection_string}')
-vehicle = connect(connection_string, wait_ready=True)
+# Vehicle se connect ho rahe hain aur HEARTBEAT ka wait karte hain
+def connect_vehicle(connection_string):
+    print(f'Connecting to vehicle on: {connection_string}')
+    vehicle = connect(connection_string, wait_ready=True)
+
+    # Ensure the vehicle is sending heartbeats
+    print("Waiting for heartbeat...")
+    while not vehicle.last_heartbeat:
+        time.sleep(1)
+    print("Heartbeat received!")
+
+    # Increase telemetry stream rates
+    print("Configuring MAVLink stream rates...")
+    vehicle.parameters['SR0_EXT_STATUS'] = 10  # System status updates
+    vehicle.parameters['SR0_EXTRA1'] = 10      # Extended statuses
+    vehicle.parameters['SR0_EXTRA2'] = 10      # Position updates
+    vehicle.parameters['SR0_EXTRA3'] = 10      # Additional data
+    vehicle.flush()
+    return vehicle
+
+vehicle = connect_vehicle(connection_string)
 
 # Drone ko arm karo aur specified altitude tak le jao
 def arm_and_takeoff(vehicle, target_altitude):
@@ -71,10 +89,18 @@ def haversine_distance(lat1, lon1, lat2, lon2):
 
 # QR code data ko GCS (Ground Control Station) ko bhejna
 def send_qr_to_gcs(vehicle, qr_data):
-    message = vehicle.message_factory.statustext_encode(
-        mavutil.mavlink.MAV_SEVERITY_INFO, qr_data.encode('utf-8'))
-    vehicle.send_mavlink(message)
-    vehicle.flush()
+    try:
+        # Truncate or adjust QR data length to meet MAVLink message requirements
+        truncated_data = qr_data[:50] if len(qr_data) > 50 else qr_data
+        message = vehicle.message_factory.statustext_encode(
+            mavutil.mavlink.MAV_SEVERITY_INFO,  # Severity level
+            truncated_data.encode('utf-8')     # QR data
+        )
+        vehicle.send_mavlink(message)
+        vehicle.flush()
+        print(f"GCS message sent: {truncated_data}")
+    except Exception as e:
+        print(f"Error sending message to GCS: {e}")
 
 # QR code ko image file se scan karna
 def scan_qr_from_image_file(image_path):
@@ -138,11 +164,17 @@ def go_to_location_with_qr_scan(vehicle, latitude, longitude, altitude, initial_
 
         if 0 <= distance <= 2:
             print("QR code ko scan kar rahe hain target location ke paas...")
+            time.sleep(2.5)  # Hover for 2.5 seconds for more precision
             target_qr_data = scan_qr_code()
-            if target_qr_data == initial_qr_data:
-                print(f"QR Code verified ho gaya target location par: {target_qr_data}")
-                qr_verified = True
-                break
+            
+            # Check for any errors or discrepancies in QR code detection
+            if target_qr_data != initial_qr_data:
+                print("QR Code mismatch detected, retrying...")
+                continue  # Retry scanning if QR doesn't match
+
+            print(f"QR Code verified ho gaya target location par: {target_qr_data}")
+            qr_verified = True
+            break
 
         if distance < 1:
             print("Target location reach ho gaya.")
@@ -175,6 +207,15 @@ def drop_payload():
     print("Payload drop ho gaya!")
     set_servo(vehicle, 6, 1500)
 
+# ** New Feature: Log Vehicle Path to File **
+def log_vehicle_path(vehicle, log_file="vehicle_path_log.txt"):
+    with open(log_file, "a") as file:
+        while True:
+            location = vehicle.location.global_relative_frame
+            file.write(f"{time.ctime()},{location.lat},{location.lon},{location.alt}\n")
+            print(f"Logged Location: {location.lat}, {location.lon}, {location.alt}")
+            time.sleep(5)
+
 # Main mission ko run karna
 def main():
     try:
@@ -193,6 +234,9 @@ def main():
             drop_payload()
         else:
             print("QR Code verification fail ho gayi. Payload drop nahi hoga.")
+
+        # Start logging vehicle path
+        log_vehicle_path(vehicle)
 
     except Exception as e:
         print(f"Ek error aayi hai: {e}")
