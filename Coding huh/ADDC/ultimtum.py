@@ -406,17 +406,20 @@ def continuous_qr_scan(cap, initial_qr_data):
 
 def precision_qr_landing(vehicle, initial_qr_data, cap, start_altitude):
     """
-    Precisely track and land on QR code while matching its orientation
+    Precision landing with QR tracking and fallback behavior
     """
     if not cap.isOpened():
         return False
         
     # Control parameters
-    DESCENT_RATE = 0.3  # m/s
-    POSITION_SENSITIVITY = 4.0
-    ROTATION_SENSITIVITY = 0.3
-    ALIGNMENT_THRESHOLD = 0.03  # Stricter position tolerance
-    ANGLE_THRESHOLD = 2.0  # degrees
+    DESCENT_RATE = 0.2  # Slower descent for more stability
+    POSITION_SENSITIVITY = 5.0  # Higher sensitivity for precise movements
+    HOVER_TIME = 1.5  # seconds to wait before dropping payload if QR lost
+    POSITION_THRESHOLD = 0.02  # Tighter position control
+    
+    last_qr_time = time.time()
+    start_hover_time = None
+    best_position = None
     
     try:
         while True:
@@ -424,146 +427,542 @@ def precision_qr_landing(vehicle, initial_qr_data, cap, start_altitude):
             if not ret:
                 continue
                 
+            # Always show camera feed with overlay
+            display_frame = frame.copy()
+            cv2.putText(display_frame, f"Alt: {vehicle.location.global_relative_frame.alt:.1f}m", 
+                       (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            cv2.imshow("Precision Landing", display_frame)
+            cv2.waitKey(1)
+                
             decoded_objects = decode(frame)
+            current_alt = vehicle.location.global_relative_frame.alt
+            
             if not decoded_objects:
-                print("QR not visible - hovering")
-                # Send hover command
+                time_since_last_qr = time.time() - last_qr_time
+                print(f"QR not visible for {time_since_last_qr:.1f}s")
+                
+                if time_since_last_qr > HOVER_TIME:
+                    print("QR lost - executing payload drop at current position")
+                    return True  # Return to trigger payload drop
+                    
+                # Hover in place
                 msg = vehicle.message_factory.set_position_target_local_ned_encode(
-                    0, 0, 0,
+                    0, 0, 0,    # time_boot_ms, target system, target component
                     mavutil.mavlink.MAV_FRAME_BODY_NED,
-                    0b0000111111000111,
-                    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+                    0b0000111111000111,  # type_mask
+                    0, 0, 0,    # x, y, z positions
+                    0, 0, 0,    # x, y, z velocity
+                    0, 0, 0,    # x, y, z acceleration
+                    0, 0)       # yaw, yaw_rate
                 vehicle.send_mavlink(msg)
                 continue
                 
+            last_qr_time = time.time()
             qr_data = decoded_objects[0].data.decode('utf-8')
             if qr_data != initial_qr_data:
                 continue
                 
-            # Get position and 3D orientation
+            # Get position and orientation
+            rel_x, rel_y, qr_angle = get_qr_position_and_orientation(frame, decoded_objects)
+            
+            if rel_x is None:
+                continue
+                
+            # Fix inverted directions
+            forward_speed = rel_y * POSITION_SENSITIVITY  # Positive is forward
+            right_speed = rel_x * POSITION_SENSITIVITY   # Positive is right
+            
+            # Calculate descent rate based on alignment
+            alignment_error = math.sqrt(rel_x**2 + rel_y**2)
+            if alignment_error < POSITION_THRESHOLD:
+                vert_speed = DESCENT_RATE
+                if best_position is None:
+                    best_position = vehicle.location.global_relative_frame
+            else:
+                vert_speed = 0  # Hold altitude until aligned
+            
+            # Send movement command
+            msg = vehicle.message_factory.set_position_target_local_ned_encode(
+                0, 0, 0,    # time_boot_ms, target system, target component
+                mavutil.mavlink.MAV_FRAME_BODY_NED,
+                0b0000111111000111,  # type_mask
+                0, 0, 0,    # x, y, z positions
+                forward_speed, right_speed, vert_speed,  # x, y, z velocity
+                0, 0, 0,    # x, y, z acceleration
+                0, qr_angle * 0.3)  # yaw, yaw_rate
+            
+            vehicle.send_mavlink(msg)
+            
+            # Debug info
+            print(f"Alt: {current_alt:.1f}m, Offset: X={rel_x:.3f}, Y={rel_y:.3f}, Error={alignment_error:.3f}")
+            
+            # Check for landing condition
+            if current_alt <= 2.0 and alignment_error < POSITION_THRESHOLD:
+                if start_hover_time is None:
+                    start_hover_time = time.time()
+                elif time.time() - start_hover_time >= 1.0:  # Stable for 1 second
+                    print("Achieved precision position for payload drop")
+                    return True
+            else:
+                start_hover_time = None
+            
+            time.sleep(0.05)  # 20Hz update rate
+            
+    except Exception as e:
+        print(f"Error during precision landing: {e}")
+        if best_position:
+            print("Using best achieved position for payload drop")
+            return True
+        return False
+
+def get_qr_centerline_orientation(frame, decoded_objects):
+    """Calculate orientation based on QR code centerline"""
+    if not decoded_objects:
+        return None, None, None
+    
+    obj = decoded_objects[0]
+    points = np.array(obj.polygon)
+    
+    # Get top and bottom center points
+    top_points = points[points[:, 1].argsort()][:2]  # Two points with lowest y
+    bottom_points = points[points[:, 1].argsort()][2:]  # Two points with highest y
+    
+    top_center = np.mean(top_points, axis=0)
+    bottom_center = np.mean(bottom_points, axis=0)
+    
+    # Calculate centerline vector
+    centerline = bottom_center - top_center
+    centerline_angle = math.degrees(math.atan2(centerline[1], centerline[0]))
+    
+    # Calculate relative position from image center
+    frame_height, frame_width = frame.shape[:2]
+    center_point = (top_center + bottom_center) / 2
+    relative_x = (center_point[0] - frame_width/2) / (frame_width/2)
+    relative_y = (center_point[1] - frame_height/2) / (frame_height/2)
+    
+    # Draw debug visualization
+    debug_frame = frame.copy()
+    cv2.line(debug_frame, 
+             tuple(map(int, top_center)), 
+             tuple(map(int, bottom_center)), 
+             (0, 255, 0), 2)
+    cv2.circle(debug_frame, 
+              tuple(map(int, center_point)), 
+              5, (0, 0, 255), -1)
+    
+    # Calculate roll and pitch based on centerline
+    centerline_length = np.linalg.norm(centerline)
+    roll_angle = math.degrees(math.asin(centerline[0] / centerline_length))
+    pitch_angle = math.degrees(math.asin(centerline[1] / centerline_length))
+    
+    cv2.putText(debug_frame, 
+                f"Roll: {roll_angle:.1f} Pitch: {pitch_angle:.1f} Yaw: {centerline_angle:.1f}", 
+                (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    
+    cv2.imshow("QR Orientation", debug_frame)
+    
+    return relative_x, relative_y, roll_angle, pitch_angle, centerline_angle
+
+def follow_qr_orientation(vehicle, initial_qr_data, cap):
+    """Follow QR using centerline orientation"""
+    if not cap.isOpened():
+        return False
+        
+    # Control parameters
+    DESCENT_RATE = 0.2
+    POSITION_SENSITIVITY = 0.3
+    ANGLE_SENSITIVITY = 0.2
+    MAX_SPEED = 0.3
+    QR_LOST_TIMEOUT = 1.5
+    
+    last_qr_time = time.time()
+    stable_start_time = None
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+            
+        decoded_objects = decode(frame)
+        current_alt = vehicle.location.global_relative_frame.alt
+        
+        if not decoded_objects:
+            time_since_qr = time.time() - last_qr_time
+            print(f"QR lost for {time_since_qr:.1f}s")
+            if time_since_qr > QR_LOST_TIMEOUT and current_alt <= 2.0:
+                return True
+            
+            # Hover in place
+            vehicle.send_mavlink(
+                vehicle.message_factory.set_attitude_target_encode(
+                    0, 0, 0, 0b00000000,
+                    [0, 0, 0, 0.5],  # Level attitude
+                    0, 0, 0, 0.5))
+            continue
+        
+        last_qr_time = time.time()
+        qr_data = decoded_objects[0].data.decode('utf-8')
+        if qr_data != initial_qr_data:
+            continue
+        
+        # Get centerline-based orientation
+        rel_x, rel_y, roll, pitch, yaw = get_qr_centerline_orientation(frame, decoded_objects)
+        if rel_x is None:
+            continue
+        
+        # Calculate control inputs
+        roll_correction = np.clip(roll * ANGLE_SENSITIVITY, -MAX_SPEED, MAX_SPEED)
+        pitch_correction = np.clip(-pitch * ANGLE_SENSITIVITY, -MAX_SPEED, MAX_SPEED)
+        yaw_correction = np.clip(yaw * ANGLE_SENSITIVITY, -MAX_SPEED, MAX_SPEED)
+        
+        # Position corrections
+        lateral_correction = np.clip(-rel_x * POSITION_SENSITIVITY, -MAX_SPEED, MAX_SPEED)
+        forward_correction = np.clip(-rel_y * POSITION_SENSITIVITY, -MAX_SPEED, MAX_SPEED)
+        
+        # Combine corrections
+        target_roll = roll_correction + lateral_correction
+        target_pitch = pitch_correction + forward_correction
+        target_yaw = yaw_correction
+        
+        # Calculate descent
+        vertical_speed = DESCENT_RATE if current_alt > 2.0 else 0
+        
+        # Send attitude command
+        msg = vehicle.message_factory.set_attitude_target_encode(
+            0, 0, 0,
+            0b00000000,
+            [target_roll, target_pitch, target_yaw, 0.5],
+            0, 0, vertical_speed,
+            0.5)
+        vehicle.send_mavlink(msg)
+        
+        # Debug info
+        print(f"Alt: {current_alt:.1f}m | Corrections - R:{roll_correction:.2f} P:{pitch_correction:.2f} Y:{yaw_correction:.2f}")
+        
+        # Check if stable at target height
+        alignment_error = math.sqrt(rel_x**2 + rel_y**2)
+        if current_alt <= 2.0 and alignment_error < 0.05:
+            if stable_start_time is None:
+                stable_start_time = time.time()
+            elif time.time() - stable_start_time > 1.0:
+                print("Stable at drop position")
+                return True
+        else:
+            stable_start_time = None
+        
+        time.sleep(0.05)
+
+def get_qr_centerline(frame, decoded_objects):
+    """Get QR code centerline and calculate orientation"""
+    if not decoded_objects:
+        return None, None, None, None
+    
+    obj = decoded_objects[0]
+    points = np.array([[p.x, p.y] for p in obj.polygon])
+    
+    # Sort points by y-coordinate
+    top_points = points[points[:, 1].argsort()][:2]
+    bottom_points = points[points[:, 1].argsort()][2:]
+    
+    # Get center points
+    top_center = np.mean(top_points, axis=0)
+    bottom_center = np.mean(bottom_points, axis=0)
+    qr_center = (top_center + bottom_center) / 2
+    
+    # Calculate centerline vector
+    centerline = bottom_center - top_center
+    
+    # Calculate angles
+    frame_height, frame_width = frame.shape[:2]
+    
+    # Draw visualization
+    debug_frame = frame.copy()
+    # Draw centerline
+    cv2.line(debug_frame, 
+             tuple(map(int, top_center)), 
+             tuple(map(int, bottom_center)), 
+             (0, 255, 0), 2)
+    # Draw center point
+    cv2.circle(debug_frame, 
+               tuple(map(int, qr_center)), 
+               5, (0, 0, 255), -1)
+    
+    # Calculate control angles
+    dx = centerline[0]
+    dy = centerline[1]
+    length = np.linalg.norm(centerline)
+    
+    # Roll: side tilt (x deviation)
+    roll_angle = math.degrees(math.atan2(dx, length))
+    
+    # Pitch: forward tilt (y deviation)
+    pitch_angle = math.degrees(math.atan2(dy, length))
+    
+    # Yaw: rotation around vertical axis
+    yaw_angle = math.degrees(math.atan2(dx, dy))
+    
+    # Position relative to frame center
+    rel_x = (qr_center[0] - frame_width/2) / (frame_width/2)
+    rel_y = (qr_center[1] - frame_height/2) / (frame_height/2)
+    
+    # Draw telemetry
+    cv2.putText(debug_frame, 
+                f"Roll: {roll_angle:.1f}° Pitch: {pitch_angle:.1f}° Yaw: {yaw_angle:.1f}°",
+                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    cv2.putText(debug_frame,
+                f"X: {rel_x:.2f} Y: {rel_y:.2f}", 
+                (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    
+    cv2.imshow("QR Tracking", debug_frame)
+    cv2.waitKey(1)
+    
+    return rel_x, rel_y, (roll_angle, pitch_angle, yaw_angle)
+
+def follow_centerline(vehicle, initial_qr_data, cap):
+    """Simple centerline-based QR following"""
+    DESCENT_RATE = 0.2
+    MAX_SPEED = 0.3
+    LOST_TIMEOUT = 1.5
+    
+    last_qr_time = time.time()
+    start_stable_time = None
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            continue
+            
+        decoded_objects = decode(frame)
+        current_alt = vehicle.location.global_relative_frame.alt
+        
+        if not decoded_objects:
+            time_since_qr = time.time() - last_qr_time
+            print(f"QR lost for {time_since_qr:.1f}s")
+            
+            if time_since_qr > LOST_TIMEOUT and current_alt <= 2.0:
+                print("QR lost - dropping payload")
+                return True
+                
+            # Hover in place
+            msg = vehicle.message_factory.set_attitude_target_encode(
+                0, 0, 0,
+                0b00000000,
+                [0, 0, 0, 0.5],  # Level attitude
+                0, 0, 0,
+                0.5)
+            vehicle.send_mavlink(msg)
+            continue
+        
+        last_qr_time = time.time()
+        qr_data = decoded_objects[0].data.decode('utf-8')
+        if qr_data != initial_qr_data:
+            continue
+        
+        rel_x, rel_y, angles = get_qr_centerline(frame, decoded_objects)
+        if rel_x is None:
+            continue
+            
+        roll_angle, pitch_angle, yaw_angle = angles
+        
+        # Convert angles to normalized control inputs (-1 to 1)
+        roll_correction = np.clip(roll_angle / 45.0, -MAX_SPEED, MAX_SPEED)
+        pitch_correction = np.clip(-pitch_angle / 45.0, -MAX_SPEED, MAX_SPEED)
+        yaw_correction = np.clip(yaw_angle / 90.0, -MAX_SPEED, MAX_SPEED)
+        
+        # Descend if above 2m
+        vertical_speed = DESCENT_RATE if current_alt > 2.0 else 0
+        
+        # Send attitude command
+        msg = vehicle.message_factory.set_attitude_target_encode(
+            0, 0, 0,
+            0b00000000,
+            [roll_correction, pitch_correction, yaw_correction, 0.5],
+            0, 0, vertical_speed,
+            0.5)
+        vehicle.send_mavlink(msg)
+        
+        # Check if stable at target height
+        alignment_error = math.sqrt(rel_x**2 + rel_y**2)
+        if current_alt <= 2.0 and alignment_error < 0.1:
+            if start_stable_time is None:
+                start_stable_time = time.time()
+            elif time.time() - start_stable_time > 1.0:
+                print("Stable at drop position")
+                return True
+        else:
+            start_stable_time = None
+        
+        time.sleep(0.05)
+
+class MissionControl:
+    def __init__(self):
+        self.cap = cv2.VideoCapture(0)
+        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        if not self.cap.isOpened():
+            raise RuntimeError("Cannot open camera")
+
+    def follow_qr_orientation(self, vehicle, initial_qr_data):
+        """Track QR and match drone orientation"""
+        DESCENT_RATE = 0.2
+        ORIENTATION_SENSITIVITY = 0.5
+        POSITION_THRESHOLD = 0.03
+        QR_LOST_TIMEOUT = 1.5
+        MAX_SPEED = 0.5  # m/s maximum movement speed
+        
+        last_qr_time = time.time()
+        stable_start_time = None
+        
+        while True:
+            ret, frame = self.cap.read()
+            if not ret:
+                continue
+                
+            # Always show camera feed
+            current_alt = vehicle.location.global_relative_frame.alt
+            cv2.putText(frame, f"ALT: {current_alt:.1f}m", (10, 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            cv2.imshow("QR Tracking", frame)
+            cv2.waitKey(1)
+            
+            decoded_objects = decode(frame)
+            
+            if not decoded_objects:
+                time_since_qr = time.time() - last_qr_time
+                print(f"No QR visible for {time_since_qr:.1f}s")
+                
+                if time_since_qr > QR_LOST_TIMEOUT:
+                    print("QR lost - dropping payload")
+                    return True
+                
+                # Hold position
+                msg = vehicle.message_factory.set_attitude_target_encode(
+                    0, 0, 0,
+                    0b00000000,
+                    [0, 0, 0, 0.5],  # Hold level
+                    0, 0, 0,
+                    0.5)
+                vehicle.send_mavlink(msg)
+                continue
+            
+            last_qr_time = time.time()
+            qr_data = decoded_objects[0].data.decode('utf-8')
+            if qr_data != initial_qr_data:
+                continue
+            
             rel_x, rel_y, qr_angle = get_qr_position_and_orientation(frame, decoded_objects)
             trans_vec, roll, pitch, yaw = get_qr_3d_orientation(frame, decoded_objects)
             
             if rel_x is None or trans_vec is None:
                 continue
-                
-            # Calculate control inputs
-            forward_speed = -rel_y * POSITION_SENSITIVITY
-            right_speed = -rel_x * POSITION_SENSITIVITY
             
-            # Match QR orientation
-            roll_rate = -roll * ROTATION_SENSITIVITY
-            pitch_rate = -pitch * ROTATION_SENSITIVITY
-            yaw_rate = -yaw * ROTATION_SENSITIVITY
+            # Limit movement speeds
+            target_roll = np.clip(rel_x * ORIENTATION_SENSITIVITY, -MAX_SPEED, MAX_SPEED)
+            target_pitch = np.clip(-rel_y * ORIENTATION_SENSITIVITY, -MAX_SPEED, MAX_SPEED)
+            target_yaw = np.clip(math.radians(qr_angle) * ORIENTATION_SENSITIVITY, -MAX_SPEED, MAX_SPEED)
             
-            current_alt = vehicle.location.global_relative_frame.alt
+            alignment_error = math.sqrt(rel_x**2 + rel_y**2)
             
-            # Always descend while maintaining position
-            vertical_speed = DESCENT_RATE
+            # Only descend if well aligned
+            if alignment_error < POSITION_THRESHOLD and current_alt > 2.0:
+                vertical_velocity = DESCENT_RATE
+            else:
+                vertical_velocity = 0
             
-            # Send movement command with attitude control
-            msg = vehicle.message_factory.set_position_target_local_ned_encode(
+            # Send attitude command
+            msg = vehicle.message_factory.set_attitude_target_encode(
                 0, 0, 0,
-                mavutil.mavlink.MAV_FRAME_BODY_NED,
-                0b0000101111000111,  # Enable attitude control
-                0, 0, 0,
-                forward_speed, right_speed, vertical_speed,
-                0, 0, 0,
-                roll_rate, pitch_rate, yaw_rate)
+                0b00000000,
+                [target_roll, target_pitch, target_yaw, 0.5],
+                0, 0, vertical_velocity,
+                0.5)
             
             vehicle.send_mavlink(msg)
-            vehicle.flush()
             
-            # Debug info
-            print(f"Alt: {current_alt:.1f}m, Offsets: X={rel_x:.3f}, Y={rel_y:.3f}")
-            print(f"Attitude: Roll={math.degrees(roll):.1f}°, Pitch={math.degrees(pitch):.1f}°, Yaw={math.degrees(yaw):.1f}°")
+            print(f"Alt: {current_alt:.1f}m | Error: {alignment_error:.3f}")
+            print(f"Roll: {math.degrees(target_roll):.1f}° Pitch: {math.degrees(target_pitch):.1f}° Yaw: {math.degrees(target_yaw):.1f}°")
             
-            # Check if we've reached target height and are aligned
-            if current_alt <= 2.0:
-                if (abs(rel_x) < ALIGNMENT_THRESHOLD and 
-                    abs(rel_y) < ALIGNMENT_THRESHOLD and
-                    abs(math.degrees(roll)) < ANGLE_THRESHOLD and
-                    abs(math.degrees(pitch)) < ANGLE_THRESHOLD):
-                    print("Aligned with QR code at target height")
+            if current_alt <= 2.0 and alignment_error < POSITION_THRESHOLD:
+                if stable_start_time is None:
+                    stable_start_time = time.time()
+                elif time.time() - stable_start_time > 1.0:
+                    print("Stable at target height")
                     return True
-                    
-            cv2.imshow("Precision Landing", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-                
-            time.sleep(0.05)  # 20Hz update rate
+            else:
+                stable_start_time = None
             
-    except Exception as e:
-        print(f"Error during precision landing: {e}")
-        return False
+            time.sleep(0.05)
 
-def go_to_location_with_qr_scan(vehicle, latitude, longitude, altitude, initial_qr_data):
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        print("Error: Cannot open camera")
-        return False
-    
-    target_location = LocationGlobalRelative(latitude, longitude, altitude)
-    vehicle.simple_goto(target_location)
-    
-    try:
+    def go_to_location_with_qr_scan(self, vehicle, latitude, longitude, altitude, initial_qr_data):
+        target_location = LocationGlobalRelative(latitude, longitude, altitude)
+        vehicle.simple_goto(target_location)
+        
         while True:
-            current_location = vehicle.location.global_relative_frame
+            ret, frame = self.cap.read()
+            if not ret:
+                continue
+                
+            cv2.imshow("QR Search", frame)
+            cv2.waitKey(1)
+            
             distance = haversine_distance(
-                current_location.lat, 
-                current_location.lon, 
-                latitude, 
-                longitude
+                vehicle.location.global_relative_frame.lat,
+                vehicle.location.global_relative_frame.lon,
+                latitude, longitude
             )
             
-            # Start looking for QR as soon as possible
-            decoded_objects = decode(cv2.cvtColor(cap.read()[1], cv2.COLOR_BGR2GRAY))
+            decoded_objects = decode(frame)
             if decoded_objects:
                 qr_data = decoded_objects[0].data.decode('utf-8')
                 if qr_data == initial_qr_data:
-                    print("QR code detected - starting precision landing")
-                    if precision_qr_landing(vehicle, initial_qr_data, cap, current_location.alt):
-                        return True
+                    print("QR detected - following orientation")
+                    return self.follow_qr_orientation(vehicle, initial_qr_data)
             
             if distance < 1:
-                print("Reached target but couldn't find QR")
-                break
-                
-            time.sleep(0.1)
+                print("Searching for QR")
+                # Execute search pattern
+                for angle in [0, 90, 180, 270]:
+                    vehicle.simple_goto(target_location)
+                    msg = vehicle.message_factory.command_long_encode(
+                        0, 0,
+                        mavutil.mavlink.MAV_CMD_CONDITION_YAW,
+                        0, angle, 45, 1, 0, 0, 0, 0)
+                    vehicle.send_mavlink(msg)
+                    time.sleep(2)
             
-    except Exception as e:
-        print(f"Error during mission: {e}")
+            time.sleep(0.1)
+        
         return False
-    finally:
-        cap.release()
-        cv2.destroyAllWindows()
-    
-    return False
 
-# Main mission ko run karna
+    def cleanup(self):
+        self.cap.release()
+        cv2.destroyAllWindows()
+
 def main():
     try:
+        mission = MissionControl()
         arm_and_takeoff(vehicle, 10)
-        print("Initial QR code scan karo:")
+        
         initial_qr_data = scan_qr_from_image_file("/home/bodhini/Documents/QrCode/QR.png")
         if not initial_qr_data:
-            print("Launch site par QR code nahi mila. Mission abort kar rahe hain.")
+            print("Launch site QR not found. Aborting.")
             return 
 
         target_lat = -35.36255470  
         target_lon = 149.16386005 
-        qr_verified = go_to_location_with_qr_scan(vehicle, target_lat, target_lon, 10, initial_qr_data)
+        
+        qr_verified = mission.go_to_location_with_qr_scan(
+            vehicle, target_lat, target_lon, 10, initial_qr_data)
 
         if qr_verified:
             drop_payload()
         else:
-            print("QR Code verification fail ho gayi. Payload drop nahi hoga.")
+            print("QR verification failed")
 
     except Exception as e:
-        print(f"Ek error aayi hai: {e}")
-
+        print(f"Error: {e}")
     finally:
-        print("Returning to Launch")
+        mission.cleanup()
         vehicle.mode = VehicleMode("RTL")
         vehicle.close()
 
