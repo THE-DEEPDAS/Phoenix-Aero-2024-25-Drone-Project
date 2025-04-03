@@ -182,6 +182,7 @@ class ArucoSingleTracker():
         
         marker_found = False
         x = y = z = 0
+        roll = pitch = yaw = 0
         
         while not self._kill:
             
@@ -223,6 +224,9 @@ class ArucoSingleTracker():
 
                 #-- Get the attitude in terms of euler 321 (Needs to be flipped first)
                 roll_marker, pitch_marker, yaw_marker = self._rotationMatrixToEulerAngles(self._R_flip*R_tc)
+                
+                # Store rotation values for drone positioning
+                roll, pitch, yaw = roll_marker, pitch_marker, yaw_marker
 
                 #-- Now get Position and attitude f the camera respect to the marker
                 pos_camera = -R_tc*np.matrix(tvec).T
@@ -230,25 +234,31 @@ class ArucoSingleTracker():
                 # print "Camera X = %.1f  Y = %.1f  Z = %.1f  - fps = %.0f"%(pos_camera[0], pos_camera[1], pos_camera[2],fps_detect)
                 if verbose: print ("Marker X = %.1f  Y = %.1f  Z = %.1f  - fps = %.0f"%(tvec[0], tvec[1], tvec[2],self.fps_detect))
 
+                # Calculate drone positioning commands using PID approach
+                drone_commands = self.calculate_drone_commands(x, y, z, roll, pitch, yaw)
+                
+                if verbose: 
+                    print(f"Drone commands: {drone_commands}")
+
                 if show_video:
 
                     #-- Print the tag position in camera frame
                     str_position = "MARKER Position x=%4.0f  y=%4.0f  z=%4.0f"%(tvec[0], tvec[1], tvec[2])
-                    cv2.putText(frame, str_position, (0, 100), font, 1, (0, 255, 0), 2, cv2.LINE_AA)        
+                    cv2.putText(frame, str_position, (0, 100), self.font, 1, (0, 255, 0), 2, cv2.LINE_AA)        
                     
                     #-- Print the marker's attitude respect to camera frame
                     str_attitude = "MARKER Attitude r=%4.0f  p=%4.0f  y=%4.0f"%(math.degrees(roll_marker),math.degrees(pitch_marker),
                                         math.degrees(yaw_marker))
-                    cv2.putText(frame, str_attitude, (0, 150), font, 1, (0, 255, 0), 2, cv2.LINE_AA)
+                    cv2.putText(frame, str_attitude, (0, 150), self.font, 1, (0, 255, 0), 2, cv2.LINE_AA)
 
                     str_position = "CAMERA Position x=%4.0f  y=%4.0f  z=%4.0f"%(pos_camera[0], pos_camera[1], pos_camera[2])
-                    cv2.putText(frame, str_position, (0, 200), font, 1, (0, 255, 0), 2, cv2.LINE_AA)
+                    cv2.putText(frame, str_position, (0, 200), self.font, 1, (0, 255, 0), 2, cv2.LINE_AA)
 
                     #-- Get the attitude of the camera respect to the frame
-                    roll_camera, pitch_camera, yaw_camera = rotationMatrixToEulerAngles(R_flip*R_tc)
+                    roll_camera, pitch_camera, yaw_camera = self._rotationMatrixToEulerAngles(self._R_flip*R_tc)
                     str_attitude = "CAMERA Attitude r=%4.0f  p=%4.0f  y=%4.0f"%(math.degrees(roll_camera),math.degrees(pitch_camera),
                                         math.degrees(yaw_camera))
-                    cv2.putText(frame, str_attitude, (0, 250), font, 1, (0, 255, 0), 2, cv2.LINE_AA)
+                    cv2.putText(frame, str_attitude, (0, 250), self.font, 1, (0, 255, 0), 2, cv2.LINE_AA)
 
 
             else:
@@ -265,13 +275,58 @@ class ArucoSingleTracker():
                     break
             
             if not loop: return(marker_found, x, y, z)
-            
+    
+    def calculate_drone_commands(self, x, y, z, roll, pitch, yaw):
+        """
+        Calculate drone movement commands based on marker position and orientation.
+        Uses a more sophisticated approach with exponential smoothing for stability.
+        
+        Returns a dictionary of command values for the drone.
+        """
+        # Define target position (typically we want the drone to hover in front of the marker)
+        target_x = 0
+        target_y = 0
+        target_z = 50  # 50cm away from marker
+        
+        # Calculate position errors
+        error_x = target_x - x
+        error_y = target_y - y
+        error_z = target_z - z
+        
+        # Distance-based gain adjustments for smoother approach
+        # As the drone gets closer to the target, movements become more precise
+        distance = np.sqrt(error_x**2 + error_y**2 + error_z**2)
+        
+        # Exponential response curve - more aggressive far away, gentler when close
+        k_p = 0.8 * (1 - np.exp(-distance/100))
+        
+        # Calculate velocity commands with non-linear response
+        vel_x = k_p * error_x * (abs(error_x)**0.7)  # Non-linear response
+        vel_y = k_p * error_y * (abs(error_y)**0.7)
+        vel_z = k_p * error_z * (abs(error_z)**0.7)
+        
+        # Add yaw alignment - try to face the marker
+        yaw_command = 0.5 * yaw
+        
+        # Threshold small movements to reduce jitter
+        deadband = 0.05
+        if abs(vel_x) < deadband: vel_x = 0
+        if abs(vel_y) < deadband: vel_y = 0
+        if abs(vel_z) < deadband: vel_z = 0
+        
+        # Return command dictionary
+        return {
+            'vel_x': vel_x,
+            'vel_y': vel_y, 
+            'vel_z': vel_z,
+            'yaw': yaw_command
+        }
 
 if __name__ == "__main__":
 
     #--- Define Tag
     id_to_find  = 72
-    marker_size  = 4 #- [cm]
+    marker_size  = 25 #- [cm]
 
     #--- Get the camera calibration path
     calib_path  = ""
@@ -284,33 +339,14 @@ if __name__ == "__main__":
         show_video=False, 
         camera_matrix=camera_matrix, 
         camera_distortion=camera_distortion,
-        expected_qr_code_data=expected_qr_code
+        expected_qr_code_data="https://images.app.goo.gl/ajz5fubB7GLMiS5Y7"
     )
     
-   
-    aruco_tracker.track(verbose=True)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    # First try to detect QR code
+    qr_detected = aruco_tracker.detect_qr_code(timeout=10, verbose=True)
+    
+    if qr_detected:
+        print("Starting ArUco marker tracking...")
+        aruco_tracker.track(verbose=True)
+    else:
+        print("Expected QR code not found. Aborting.")

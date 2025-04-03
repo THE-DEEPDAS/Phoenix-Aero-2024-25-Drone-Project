@@ -3,15 +3,14 @@ from dronekit import connect, VehicleMode, LocationGlobalRelative  # Drone contr
 import time  # For timing and delays
 from pyzbar.pyzbar import decode  # QR code detection library
 import cv2  # OpenCV for image processing
-from math import radians, cos  # Required for GPS adjustments
+from math import radians, cos  # Required for GPS adjustments 
 
 # Connect to the vehicle
 import argparse
 
 # Setup command line argument parser
 parser = argparse.ArgumentParser()
-parser.add_argument('--connect', default='127.0.0.1:14550',
-                    help="Vehicle connection target string.")  
+parser.add_argument('--connect', default='/dev/ttyACM0')
 args = parser.parse_args()
 
 # Global variables
@@ -21,11 +20,14 @@ def initialize_vehicle(connection_string):
     """Initialize vehicle connection"""
     global original_home
     print(f'Connecting to vehicle on: {connection_string}')
-    vehicle = connect(connection_string, wait_ready=True)
-    vehicle.parameters['ARMING_CHECK'] = 0
-    original_home = vehicle.location.global_frame
-    print(f"Original home location stored: {original_home}")
-    return vehicle
+    try:
+        vehicle = connect(connection_string, wait_ready=True, baud=57600)  # Fixed baud for Pixhawk
+        original_home = vehicle.location.global_frame
+        print(f"Connected to Pixhawk. Home location: {original_home}")
+        return vehicle
+    except Exception as e:
+        print(f"Connection failed: {str(e)}")
+        raise
 
 # Define the expected QR code data for verification
 expected_qr_code_data = "https://qrfy.io/lIHOlbM_zI"
@@ -283,6 +285,17 @@ def run_complete_mission(target_lat, target_lon, target_alt, connection_string, 
     """Run the complete mission sequence with GUI updates"""
     vehicle = None
     try:
+        # Ensure all parameters are proper type
+        target_lat = float(target_lat)
+        target_lon = float(target_lon)
+        target_alt = float(target_alt)
+        
+        print(f"Starting mission with parameters:")
+        print(f"Latitude: {target_lat}")
+        print(f"Longitude: {target_lon}")
+        print(f"Altitude: {target_alt}")
+        print(f"Connection: {connection_string}")
+        
         vehicle = initialize_vehicle(connection_string)
         print("Starting mission...")
         
@@ -351,7 +364,9 @@ def run_complete_mission(target_lat, target_lon, target_alt, connection_string, 
 print("Drone control script is ready for SITL execution.")
 
 if __name__ == "__main__":
-    # Open a dummy camera feed for testing
-    cap = cv2.VideoCapture(0)
+    # Setup camera with 800x600 resolution
+    cap = cv2.VideoCapture(1)  # Pi camera or USB camera
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 800)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 600)
     run_complete_mission('21.1598244', '72.7863403', '10', args.connect, cap)
     cap.release()

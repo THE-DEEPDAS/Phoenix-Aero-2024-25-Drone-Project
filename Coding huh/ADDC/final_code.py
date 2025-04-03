@@ -8,9 +8,8 @@ from dronekit import connect, VehicleMode, LocationGlobalRelative, Command, Loca
 from pymavlink import mavutil
 from opencv.lib_aruco_pose import *
 # Option parsing ke liye command-line arguments ko set karo
-parser = argparse.ArgumentParser(description='Vehicle ko control karta hai using vehicle.simple_goto aur object track karta hai.')
-parser.add_argument('--connect', default='127.0.0.1:14550',
-                    help="Vehicle connection string. Agar specify nahi kiya toh SITL automatically start hoga aur use kiya jayega.")
+parser = argparse.ArgumentParser()
+parser.add_argument('--connect' , default = '/dev/ttyACM0')
 args = parser.parse_args()
 
 connection_string = args.connect

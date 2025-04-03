@@ -21,10 +21,20 @@ class DroneGUI:
         self.root = root
         self.root.title("Drone Control Interface")
         self.mission_running = False
-        self.cap = cv2.VideoCapture(0)
+
+        # GStreamer pipeline for Raspberry Pi camera
+        gst_pipeline = (
+            "libcamerasrc ! video/x-raw,width=800,height=600,framerate=30/1 ! "
+            "videoconvert ! appsink"
+        )
+        self.cap = cv2.VideoCapture(gst_pipeline, cv2.CAP_GSTREAMER)
+
+        if not self.cap.isOpened():
+            messagebox.showerror("Camera Error", "Failed to open camera. Check GStreamer pipeline.")
+            return
 
         # Create main frames
-        self.setup_frame = ttk.LabelFrame(root, text="Simulation Setup", padding=10)
+        self.setup_frame = ttk.LabelFrame(root, text="Mission Setup", padding=10)
         self.setup_frame.grid(row=0, column=0, padx=5, pady=5, sticky="nsew")
         
         self.camera_frame = ttk.LabelFrame(root, text="Camera Feed", padding=10)
@@ -36,7 +46,7 @@ class DroneGUI:
         # Setup inputs
         ttk.Label(self.setup_frame, text="Connection:").grid(row=0, column=0)
         self.connection = ttk.Entry(self.setup_frame)
-        self.connection.insert(0, '127.0.0.1:14550')  # Default SITL connection
+        self.connection.insert(0, '/dev/ttyACM0')  # Default Pixhawk connection on Pi
         self.connection.grid(row=0, column=1)
 
         ttk.Label(self.setup_frame, text="Target Latitude:").grid(row=1, column=0)
@@ -86,14 +96,33 @@ class DroneGUI:
 
     def execute_mission(self):
         try:
+            # Validate inputs before starting mission
+            try:
+                target_lat = float(self.target_lat.get())
+                target_lon = float(self.target_lon.get())
+                target_alt = float(self.target_alt.get())
+                connection = self.connection.get().strip()
+                
+                if not connection:
+                    raise ValueError("Connection string cannot be empty")
+                if not (0 <= target_lat <= 90 and 0 <= target_lon <= 180):
+                    raise ValueError("Invalid latitude/longitude values")
+                if not (0 < target_alt <= 100):
+                    raise ValueError("Altitude must be between 0 and 100 meters")
+                
+            except ValueError as e:
+                self.status_label.config(text="Status: Invalid Input")
+                messagebox.showerror("Input Error", str(e))
+                return
+
             self.status_label.config(text="Status: Mission Started")
             self.qr_label.config(text="QR Status: Searching...")
             
             success, qr_verified = run_complete_mission(
-                self.target_lat.get(),
-                self.target_lon.get(),
-                self.target_alt.get(),
-                self.connection.get(),
+                target_lat,  # Using validated float values
+                target_lon,
+                target_alt,
+                connection,
                 self.cap,
                 self.update_qr_status  # Pass callback for QR updates
             )
@@ -114,7 +143,7 @@ class DroneGUI:
         ret, frame = self.cap.read()
         if ret:
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame = cv2.resize(frame, (640, 480))
+            frame = cv2.resize(frame, (800, 600))  # Medium resolution
             photo = ImageTk.PhotoImage(image=Image.fromarray(frame))
             self.camera_label.configure(image=photo)
             self.camera_label.image = photo
