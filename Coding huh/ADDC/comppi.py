@@ -11,6 +11,7 @@ from PIL import Image, ImageTk
 import io
 import random
 import math
+from pyzbar.pyzbar import decode  # Add this import
 
 class DroneGUI:
     def __init__(self, root):
@@ -66,6 +67,7 @@ class DroneGUI:
         self.mission_thread = None
         self.mission_running = False
         self.camera = None
+        self.use_qr_precision = False  # Flag to control QR precision landing
 
     def create_input_fields(self):
         labels = ["Target Latitude:", "Target Longitude:", "Target Altitude:", 
@@ -278,6 +280,94 @@ class DroneGUI:
         if self.vehicle:
             self.vehicle.close()
 
+    def adjust_and_descend_to_qr(self, vehicle, target_altitude=1.0):
+        """
+        Adjusts the drone's position while descending to hover over the QR code.
+        """
+        print("Opening camera for QR code detection...")
+        timeout = 60  # Wait for 60 seconds to detect a QR code
+        start_time = time.time()
+
+        qr_detected_once = False  # Track if QR code was detected at least once
+
+        while True:
+            try:
+                frame = capture_frame_with_libcamera()
+            except RuntimeError as e:
+                print(f"Error capturing frame: {e}")
+                break
+
+            # Decode QR codes in the frame
+            detected_objects = decode(frame)
+            qr_found = False
+            for obj in detected_objects:
+                qr_data = obj.data.decode('utf-8')
+                print(f"Detected QR Code: {qr_data}")
+                if verify_qr_code_data(qr_data):
+                    print("Expected QR code detected!")
+                    qr_found = True
+                    qr_detected_once = True
+                    # Get the QR code's bounding box center
+                    points = obj.polygon
+                    if len(points) > 0:
+                        cx = int((points[0].x + points[2].x) / 2)
+                        cy = int((points[0].y + points[2].y) / 2)
+                        frame_center_x = frame.shape[1] // 2
+                        frame_center_y = frame.shape[0] // 2
+                        
+                        # Calculate offset
+                        offset_x = cx - frame_center_x
+                        offset_y = cy - frame_center_y
+
+                        # Adjust drone's position based on offset
+                        movement_lat = vehicle.location.global_relative_frame.lat
+                        movement_lon = vehicle.location.global_relative_frame.lon
+                        
+                        # Convert pixel offsets into lat/lon adjustments (simplified)
+                        adjustment_factor = 0.000001  # Tune this factor based on your setup
+                        movement_lat -= offset_y * adjustment_factor
+                        movement_lon += offset_x * adjustment_factor
+
+                        # Descend while correcting position
+                        current_altitude = vehicle.location.global_relative_frame.alt
+                        descent_step = 0.3  # 30 cm per second
+                        target_location = LocationGlobalRelative(
+                            movement_lat, movement_lon, max(current_altitude - descent_step, target_altitude)
+                        )
+                        vehicle.simple_goto(target_location)
+                        print(f"Adjusting position and descending: Offset X={offset_x}, Offset Y={offset_y}, Location={current_altitude:.2f}, {movement_lat:.9f}, {movement_lon:.9f}")
+
+                        # Check if QR code is centered and at target altitude
+                        if abs(offset_x) < 10 and abs(offset_y) < 10 and current_altitude <= target_altitude + 0.1:
+                            print("QR code centered and target altitude reached. Hovering...")
+                            return True
+
+            if not qr_found and qr_detected_once:
+                # If QR code was detected once but now it's lost
+                print("QR code disappeared. Continuing descent to fallback altitude...")
+                current_altitude = vehicle.location.global_relative_frame.alt
+                descent_step = 0.3  # 30 cm per second
+                if current_altitude > target_altitude:
+                    target_location = LocationGlobalRelative(
+                        vehicle.location.global_relative_frame.lat,
+                        vehicle.location.global_relative_frame.lon,
+                        max(current_altitude - descent_step, target_altitude)
+                    )
+                    vehicle.simple_goto(target_location)
+                    print(f"Descending to 1 meter: Current Altitude = {current_altitude:.2f}")
+                    time.sleep(1)
+                elif current_altitude <= target_altitude:
+                    print("Reached fallback altitude of 1 meter.")
+                    return True
+
+            # Check if timeout has been reached
+            if time.time() - start_time > timeout:
+                print("Timeout: No QR code detected after 60 seconds.")
+                break
+                
+        print("QR code adjustment failed or not detected.")
+        return False
+
     def start_mission(self):
         if not self.vehicle:
             messagebox.showerror("Error", "Connect to the drone first!")
@@ -295,7 +385,7 @@ class DroneGUI:
         try:
             # Store home location
             Home = self.vehicle.location.global_frame
-            target_alt = float(self.entries['target_altitude'].get())
+            target_alt = float(self.entries['target_altitude'].get()) 
             Home.alt = target_alt
 
             # First takeoff
@@ -319,12 +409,14 @@ class DroneGUI:
                 distance = self.get_distance_metres(current_loc, point1)
                 
                 if distance < 1.0:  # Within 1 meter of target
-                    self.update_message(self.qr_message_pane, f"QR detected: {self.entries['qr_code_data'].get()}")
-                    self.update_message(self.message_pane, "Reached target location - Finding QR code")
-                    time.sleep(7)  # Hover for 7 seconds
-                    print(f"QR code data detected: {self.entries['qr_code_data'].get()}")
+                    # Optionally use precision landing (disabled by default)
+                    if self.use_qr_precision:
+                        self.adjust_and_descend_to_qr(self.vehicle)
+                    else:
+                        self.update_message(self.qr_message_pane, f"QR detected: {self.entries['qr_code_data'].get()}")
+                        self.update_message(self.message_pane, "Reached target location - Finding QR code")
+                        time.sleep(7)
                     target_reached = True
-                time.sleep(1)
 
             # Land at target location
             self.update_message(self.message_pane, "Landing at target location")
