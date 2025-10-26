@@ -1,0 +1,5 @@
+For connecting the RX and TX we use a binding cable connected in the B/VCC port, if you don't have that then take one jumper wire and short the Signal and Ground so it enters the binding mode(continuous blinks on the receiver) and then go to the transmitter and then go to system and then bind 
+
+we need to correct the output mode, the pixhawk necessarily needs PPM but the output of receiver is multiplexed as CH1 and PPM so go to the system then to the output mode and then select PPM
+
+S.BUS or I.BUS is for telemetry and we don't use that so no need to do any changes in that

@@ -1,0 +1,6 @@
+In Compass priority, firstly remove all the GPS that were used earlier but now are not In use. Then set the priority and let the orientation get initialized on its own to Yaw270. Also keep using 2 compasses, even if you have only 1 connected. Automatically learn offsets = True. 
+
+In params check:
+AHRS_EKF3_TYPE=3
+EKF3_ENABLE=1
+AHRS_GPS_USE=1
