@@ -1,7 +1,7 @@
 # Phoenix Aero 2024-25 Drone Project
 
 🏆 **Achievement**  
-Secured **All India Rank 2 (AIR 2)** at the **SAE Autonomous Drone Development Competition (ADDC) 2024**, showcasing excellence in drone design, development, and innovation.
+Secured **All India Rank 2 (AIR 2)** at the **SAE Autonomous Drone Development Competition (ADDC) 2025**, showcasing excellence in drone design, development, and innovation.
 
 ## 📖 Overview
 
